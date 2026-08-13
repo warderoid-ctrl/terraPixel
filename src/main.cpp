@@ -142,6 +142,38 @@ void handleSet() {
   server.send(303);
 }
 
+// ---------- machine-readable API (terraTouch dial) ----------
+// The dial polls /status every 3s and pushes changes to /set and /party.
+// It resolves us as terrapen-leds.local, the same name we advertise below.
+const char* modeName(Mode m) {
+  switch (m) {
+    case M_IDLE:   return "IDLE";
+    case M_RUN:    return "RUN";
+    case M_HOLD:   return "HOLD";
+    case M_ALARM:  return "ALARM";
+    case M_HOMING: return "HOMING";
+    case M_DONE:   return "DONE";
+    default:       return "BOOT";
+  }
+}
+
+void handleStatus() {
+  char json[160];
+  snprintf(json, sizeof(json),
+    "{\"filmMode\":%s,\"brightness\":%u,\"radius\":%.1f,\"party\":%s,\"mode\":\"%s\"}",
+    filmMode ? "true" : "false", filmBrightness, cometRadiusLeds,
+    partyMode ? "true" : "false", modeName(mode));
+  server.send(200, "application/json", json);
+}
+
+// Unlike /set this must answer 200 -- the dial rejects anything else outright.
+void handleParty() {
+  if (!filmMode) partyMode = !partyMode;   // same rule as the button: never mid-take
+  char json[32];
+  snprintf(json, sizeof(json), "{\"party\":%s}", partyMode ? "true" : "false");
+  server.send(200, "application/json", json);
+}
+
 // ---------- setup ----------
 void setup() {
   Serial.begin(115200);
@@ -164,6 +196,8 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/set", HTTP_POST, handleSet);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/party", HTTP_POST, handleParty);
   server.begin();
 }
 
@@ -399,6 +433,20 @@ void loop() {
     connectToFluidNC();
   } else {
     pumpSerialStream();
+
+    // FluidNC's auto-report gates its interval timer on motionState(), so a
+    // parked machine transmits nothing at all -- silence does NOT imply a dead
+    // link. Poke it with '?' (a realtime char: no newline, safe to inject
+    // mid-stream) once a second whenever the channel goes quiet, so the
+    // watchdog below is judging an unanswered question rather than an idle
+    // machine. During a job the 50ms auto-reports keep us under the threshold
+    // and this never fires.
+    static uint32_t lastPoll = 0;
+    if (millis() - lastRxAt > 1500 && millis() - lastPoll > 1000) {
+      lastPoll = millis();
+      fluid.print('?');
+    }
+
     // Prolonged silence means the link died without a clean close.
     if (millis() - lastRxAt > 8000) { fluid.stop(); mode = M_BOOT; }
   }
